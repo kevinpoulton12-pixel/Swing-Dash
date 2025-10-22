@@ -1,16 +1,31 @@
 # swing_dashboard_pro.py
-# Streamlit Swing Trading Dashboard (Watchlist + Positions + Trade Log)
-# Small-account friendly, supports fractional shares
+# Streamlit Swing Trading Dashboard — Watchlist • Positions • Trade Log • Alerts • Alpaca demo
+# Small-account friendly + fractional shares
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import datetime as dt
 
+# Optional libs
 try:
     import yfinance as yf
 except Exception:
     yf = None
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+except Exception:
+    go = None
+    px = None
+try:
+    import smtplib, ssl
+except Exception:
+    smtplib = None
+try:
+    import requests
+except Exception:
+    requests = None
 
 # ---------- Indicators ----------
 def sma(s, n): 
@@ -60,9 +75,38 @@ def position_size(account_size, risk_pct, entry, stop, allow_fractional=False):
         return shares, rps, shares * entry
     return (0 if not allow_fractional else 0.0), 0.0, 0.0
 
+# ---------- Email ----------
+def send_email_smtp(recipient, subject, body, smtp=None):
+    """Uses Streamlit secrets if present. Provide smtp dict override to use custom creds."""
+    if smtplib is None:
+        return False, "smtplib not available"
+    # Secrets structure:
+    # [smtp]
+    # host="smtp.gmail.com"
+    # port=587
+    # user="you@example.com"
+    # pass="app_password"
+    conf = smtp or st.secrets.get("smtp", {})
+    host = conf.get("host", "smtp.gmail.com")
+    port = int(conf.get("port", 587))
+    user = conf.get("user", "")
+    pw   = conf.get("pass", "")
+    if not (recipient and user and pw and host and port):
+        return False, "Missing SMTP settings or recipient"
+    msg = f"Subject: {subject}\nFrom: {user}\nTo: {recipient}\n\n{body}"
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP(host, port) as server:
+            server.starttls(context=context)
+            server.login(user, pw)
+            server.sendmail(user, [recipient], msg.encode("utf-8"))
+        return True, "Sent"
+    except Exception as e:
+        return False, str(e)
+
 # ---------- UI: Sidebar ----------
 st.set_page_config(page_title="Swing Trading Dashboard", layout="wide")
-st.title("📈 Swing Trading Dashboard — Watchlist • Positions • Trade Log")
+st.title("📈 Swing Trading Dashboard — Watchlist • Positions • Trade Log • Alerts")
 
 with st.sidebar:
     st.header("Settings")
@@ -88,30 +132,42 @@ with st.sidebar:
 # ---------- Load Data ----------
 df = pd.DataFrame()
 
-if source == "Yahoo Finance":
+@st.cache_data(show_spinner=False)
+def load_yf(symbols, start_date, end_date):
     if yf is None:
-        st.error("yfinance not installed. Run: pip install yfinance")
-    else:
-        syms = [s.strip().upper() for s in tickers.split(",") if s.strip()]
-        if len(syms):
-            data = yf.download(syms, start=start_date, end=end_date, auto_adjust=False, threads=True, group_by='ticker')
-            frames = []
-            for sym in syms:
-                try:
-                    d = data[sym].reset_index().rename(columns=str.title)
-                    d["Ticker"] = sym
-                    frames.append(d[["Date","Open","High","Low","Close","Volume","Ticker"]])
-                except Exception:
-                    pass
-            if len(frames):
-                df = pd.concat(frames).dropna().reset_index(drop=True)
+        return pd.DataFrame(), "yfinance not installed"
+    try:
+        data = yf.download(symbols, start=start_date, end=end_date, auto_adjust=False, threads=True, group_by='ticker')
+        frames = []
+        for sym in symbols:
+            try:
+                d = data[sym].reset_index().rename(columns=str.title)
+                d["Ticker"] = sym
+                frames.append(d[["Date","Open","High","Low","Close","Volume","Ticker"]])
+            except Exception:
+                pass
+        if frames:
+            return pd.concat(frames).dropna().reset_index(drop=True), ""
+        return pd.DataFrame(), "No data"
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+if source == "Yahoo Finance":
+    syms = [s.strip().upper() for s in tickers.split(",") if s.strip()]
+    if syms:
+        df, err = load_yf(syms, start_date, end_date)
+        if err:
+            st.warning(f"Yahoo: {err}")
 else:
     if uploaded is not None:
-        df = pd.read_csv(uploaded)
-        if "Ticker" not in df.columns:
-            df["Ticker"] = "TICK"
-        df["Date"] = pd.to_datetime(df["Date"])
-        df = df.sort_values(["Ticker","Date"]).reset_index(drop=True)
+        try:
+            df = pd.read_csv(uploaded)
+            if "Ticker" not in df.columns:
+                df["Ticker"] = "TICK"
+            df["Date"] = pd.to_datetime(df["Date"])
+            df = df.sort_values(["Ticker","Date"]).reset_index(drop=True)
+        except Exception as e:
+            st.error(f"CSV read error: {e}")
 
 if df.empty:
     st.info("Load data to begin — use Yahoo Finance or upload your CSV.")
@@ -131,7 +187,7 @@ df = df.groupby("Ticker", group_keys=False).apply(compute_indicators)
 latest = df.sort_values("Date").groupby("Ticker").tail(1).copy()
 
 # ---------- Tabs ----------
-tab1, tab2, tab3 = st.tabs(["🔎 Watchlist", "📦 Positions", "📘 Trade Log"])
+tab1, tab2, tab3, tab4 = st.tabs(["🔎 Watchlist", "📦 Positions", "📘 Trade Log", "⚙️ Alerts & Broker"])
 
 # --- Watchlist ---
 with tab1:
@@ -161,32 +217,6 @@ with tab1:
 
     if (not allow_fractional) and isinstance(shares, int) and shares == 0:
         st.caption("Shares = 0 because your per-share risk exceeds your $ risk limit. Try a cheaper ticker, tighter stop, or enable fractional shares.")
-
-    st.caption("Sizing = floor((Account × Risk%) / (Entry − Stop)) if fractional OFF; else (Account × Risk%)/(Entry − Stop).")
-
-    # Charts (if Plotly available)
-    try:
-        import plotly.graph_objects as go
-        import plotly.express as px
-
-        st.subheader("Charts")
-        view = df[df["Ticker"] == sel].copy().tail(200)
-        candles = go.Candlestick(
-            x=view["Date"], open=view["Open"], high=view["High"], low=view["Low"], close=view["Close"], name="Price"
-        )
-        sma20_line = go.Scatter(x=view["Date"], y=view["SMA20"], name="SMA20")
-        sma50_line = go.Scatter(x=view["Date"], y=view["SMA50"], name="SMA50")
-        fig = go.Figure(data=[candles, sma20_line, sma50_line])
-        fig.update_layout(height=480, xaxis_rangeslider_visible=False, margin=dict(l=20,r=20,t=30,b=20))
-        st.plotly_chart(fig, use_container_width=True)
-
-        rsi_fig = px.line(view, x="Date", y="RSI14", title="RSI14")
-        rsi_fig.add_hline(y=30, line_dash="dot")
-        rsi_fig.add_hline(y=70, line_dash="dot")
-        st.plotly_chart(rsi_fig, use_container_width=True)
-    except Exception as e:
-        st.info("Install Plotly for charts: pip install plotly")
-        st.caption(f"(Chart import error: {e})")
 
 # --- Positions ---
 def default_positions_df():
@@ -280,3 +310,86 @@ with tab3:
     def recompute_log(df_log, pos_df):
         df_log = df_log.copy()
         stop_map = {}
+        if pos_df is not None and not pos_df.empty:
+            stop_map = pos_df.dropna(subset=["Ticker","InitialStop"]).set_index("Ticker")["InitialStop"].to_dict()
+        for i, r in df_log.iterrows():
+            if pd.notna(r.get("ExitPrice")) and pd.notna(r.get("EntryPrice")) and pd.notna(r.get("Shares")):
+                df_log.at[i,"GrossPL"] = (r["ExitPrice"] - r["EntryPrice"]) * r["Shares"]
+                stop = stop_map.get(r.get("Ticker"))
+                if stop is not None and pd.notna(stop) and r["EntryPrice"] != stop:
+                    df_log.at[i,"R"] = (r["ExitPrice"] - r["EntryPrice"]) / (r["EntryPrice"] - stop)
+        return df_log
+
+    edited_log = st.data_editor(
+        st.session_state.tradelog,
+        num_rows="dynamic",
+        column_config={
+            "EntryDate": st.column_config.DateColumn(format="YYYY-MM-DD"),
+            "ExitDate": st.column_config.DateColumn(format="YYYY-MM-DD"),
+            "Setup": st.column_config.SelectboxColumn(options=["Pullback20","Breakout","Reversal","Other"]),
+        },
+        use_container_width=True
+    )
+    st.session_state.tradelog = recompute_log(edited_log, st.session_state.get("positions"))
+
+    if not st.session_state.tradelog.empty:
+        realized = st.session_state.tradelog["GrossPL"].fillna(0).sum()
+        avg_r = st.session_state.tradelog["R"].replace([np.inf,-np.inf], np.nan).dropna().mean()
+        c1, c2 = st.columns(2)
+        c1.metric("Realized P/L", f"${realized:,.2f}")
+        c2.metric("Avg R", f"{avg_r:.2f}" if pd.notna(avg_r) else "-")
+
+    clog1, clog2 = st.columns(2)
+    with clog1:
+        st.download_button(
+            "⬇️ Download Trade Log CSV",
+            st.session_state.tradelog.to_csv(index=False).encode(),
+            "trade_log.csv",
+            "text/csv",
+        )
+    with clog2:
+        log_csv = st.file_uploader("Upload Trade Log CSV", type=["csv"], key="log_up")
+        if log_csv is not None:
+            st.session_state.tradelog = pd.read_csv(log_csv)
+            st.success("Trade log loaded.")
+
+# --- Alerts & Broker ---
+with tab4:
+    st.subheader("Signal Alerts")
+    st.caption("Sends an email when any ticker is in the “Look to Buy” state (based on latest close).")
+    default_to = st.secrets.get("alert_to", "")
+    recipient = st.text_input("Recipient email", value=default_to)
+    if st.button("Scan & Send Alerts"):
+        alerts = latest[latest["SuggestedAction"] == "Look to Buy"].copy()
+        if alerts.empty:
+            st.info("No 'Look to Buy' signals right now.")
+        else:
+            lines = ["Swing Signal Alerts:\n"]
+            for _, r in alerts.iterrows():
+                lines.append(f"- {r['Ticker']}: Close={r['Close']:.2f} | SMA20={r['SMA20']:.2f} | ATR={r['ATR14']:.2f} | RSI={r['RSI14']:.1f}")
+            ok, msg = send_email_smtp(recipient, "Swing Alerts", "\n".join(lines))
+            if ok:
+                st.success(f"Email sent to {recipient}")
+            else:
+                st.error(f"Email failed: {msg}")
+
+    st.divider()
+    st.subheader("Alpaca (demo)")
+    st.caption("Shows how to wire a broker. Requires keys and may need paid data.")
+    alp = st.secrets.get("alpaca", {})
+    ak = st.text_input("ALPACA_API_KEY", value=alp.get("key", ""))
+    sk = st.text_input("ALPACA_API_SECRET", value=alp.get("secret", ""), type="password")
+    base = st.text_input("Base URL", value=alp.get("base", "https://paper-api.alpaca.markets"))
+    if requests is None:
+        st.info("Install requests to use this demo (add 'requests' to requirements.txt).")
+    elif st.button("Check Alpaca Account"):
+        try:
+            hdrs = {"APCA-API-KEY-ID": ak, "APCA-API-SECRET-KEY": sk}
+            r = requests.get(base.rstrip("/") + "/v2/account", headers=hdrs, timeout=10)
+            if r.status_code == 200:
+                acct = r.json()
+                st.write({k: acct.get(k) for k in ["id","currency","cash","portfolio_value","status"]})
+            else:
+                st.warning(f"Status {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            st.error(f"Alpaca call failed: {e}")
