@@ -58,7 +58,7 @@ st.title("📈 Swing Trading Dashboard")
 
 with st.sidebar:
     st.header("Settings")
-    acct = st.number_input("Account Size ($)", 25000, step=1000)
+    account_size = st.number_input("Account Size ($)", min_value=0.0, value=1000.0, step=100.0)
     risk = st.number_input("Risk per Trade (%)", 1.0, step=0.25, format="%.2f")
     stop_mult = st.number_input("ATR Multiplier (Initial Stop)", 1.5, step=0.1, format="%.1f")
     st.divider()
@@ -143,3 +143,4 @@ except Exception as e:
     st.caption(f"(Chart import error: {e})")
 
 st.success("Ready. Use Yahoo mode (needs internet) or CSV upload for offline use.")
+
