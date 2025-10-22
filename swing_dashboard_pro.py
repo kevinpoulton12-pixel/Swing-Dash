@@ -1,6 +1,6 @@
 # swing_dashboard_pro.py
 # Streamlit Swing Trading Dashboard — Watchlist • Positions • Trade Log • Alerts • Alpaca demo
-# Small-account friendly + fractional shares
+# Small-account friendly + fractional shares + CHARTS
 
 import streamlit as st
 import pandas as pd
@@ -28,7 +28,7 @@ except Exception:
     requests = None
 
 # ---------- Indicators ----------
-def sma(s, n): 
+def sma(s, n):
     return s.rolling(n).mean()
 
 def rsi_wilder(close, n=14):
@@ -80,7 +80,7 @@ def send_email_smtp(recipient, subject, body, smtp=None):
     """Uses Streamlit secrets if present. Provide smtp dict override to use custom creds."""
     if smtplib is None:
         return False, "smtplib not available"
-    # Secrets structure:
+    # Secrets structure in Streamlit Cloud:
     # [smtp]
     # host="smtp.gmail.com"
     # port=587
@@ -217,6 +217,51 @@ with tab1:
 
     if (not allow_fractional) and isinstance(shares, int) and shares == 0:
         st.caption("Shares = 0 because your per-share risk exceeds your $ risk limit. Try a cheaper ticker, tighter stop, or enable fractional shares.")
+
+    st.caption("Sizing = floor((Account × Risk%) / (Entry − Stop)) if fractional OFF; else (Account × Risk%)/(Entry − Stop).")
+
+    # ---- Charts (with explicit checks) ----
+    st.subheader("Charts")
+
+    # 1) Verify Plotly import
+    try:
+        import plotly.graph_objects as _go
+        import plotly.express as _px
+    except Exception as e:
+        st.error("Plotly is not installed. Add 'plotly' to requirements.txt and redeploy.")
+        st.caption(f"(Import error: {e})")
+        st.stop()
+
+    # 2) Get last ~200 bars for the selected ticker
+    view = df[df["Ticker"] == sel].copy().tail(200)
+
+    # 3) Validate data before plotting
+    needed = ["Date","Open","High","Low","Close","SMA20","SMA50","RSI14"]
+    missing = [c for c in needed if c not in view.columns]
+    if missing:
+        st.error(f"Missing columns for chart: {missing}. Check your CSV column names.")
+        st.stop()
+    if view.empty or view["Close"].isna().all():
+        st.warning("No price data to plot. Try different tickers or a wider date range.")
+        st.stop()
+
+    # 4) Price + SMAs
+    candles = _go.Candlestick(
+        x=view["Date"],
+        open=view["Open"], high=view["High"], low=view["Low"], close=view["Close"],
+        name="Price"
+    )
+    sma20_line = _go.Scatter(x=view["Date"], y=view["SMA20"], name="SMA20")
+    sma50_line = _go.Scatter(x=view["Date"], y=view["SMA50"], name="SMA50")
+    fig = _go.Figure(data=[candles, sma20_line, sma50_line])
+    fig.update_layout(height=500, xaxis_rangeslider_visible=False, margin=dict(l=20,r=20,t=30,b=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 5) RSI panel
+    rsi_fig = _px.line(view, x="Date", y="RSI14", title="RSI14")
+    rsi_fig.add_hline(y=30, line_dash="dot")
+    rsi_fig.add_hline(y=70, line_dash="dot")
+    st.plotly_chart(rsi_fig, use_container_width=True)
 
 # --- Positions ---
 def default_positions_df():
