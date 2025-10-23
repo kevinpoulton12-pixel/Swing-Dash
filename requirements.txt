@@ -1,20 +1,5 @@
-# === Swing Dashboard Dependencies ===
-
-# Web app framework
 streamlit==1.43.0
-
-# Data manipulation and math
 pandas==2.2.3
 numpy==1.26.4
-
-# Market data source (Yahoo Finance)
-yfinance==0.2.50
-
-# Interactive charts (candlesticks, MACD, RSI)
+yfinance==0.2.66
 plotly==5.24.1
-
-# Optional: uncomment below only if you add future features
-# requests==2.32.3          # for custom API calls (e.g., Twilio SMS)
-# sqlalchemy==2.0.35        # for database storage of positions
-# backtesting==0.3.3        # for strategy testing engine
-# scikit-learn==1.5.2       # for machine learning signals
