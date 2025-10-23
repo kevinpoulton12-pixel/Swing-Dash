@@ -1,440 +1,357 @@
-# swing_dashboard_pro.py
-# Streamlit Swing Trading Dashboard — Watchlist • Positions • Trade Log • Alerts • Alpaca demo
-# Small-account friendly + fractional shares + CHARTS
+# swing_dashboard_pro_resilient.py
+# Streamlit Swing Dashboard — resilient rewrite
+# - URL + session ticker persistence
+# - Robust yfinance download (single or multiple tickers)
+# - Safe caching (tuple-hashed args) and defensive schema checks
+# - Common indicators (SMA, EMA, RSI, MACD, Bollinger)
+# - Optional Plotly charts (fallback to st.line_chart)
+# - Simple “bull flag” heuristic scanner
+
+import os
+import math
+import datetime as dt
+from typing import List, Tuple, Optional
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import datetime as dt
 
-# Optional libs
+# Optional libraries
 try:
-    import yfinance as yf
+    import yfinance as yf  # type: ignore
 except Exception:
     yf = None
+
 try:
-    import plotly.graph_objects as go
-    import plotly.express as px
+    import plotly.graph_objects as go  # type: ignore
 except Exception:
     go = None
-    px = None
-try:
-    import smtplib, ssl
-except Exception:
-    smtplib = None
-try:
-    import requests
-except Exception:
-    requests = None
 
-# ---------- Indicators ----------
-def sma(s, n):
-    return s.rolling(n).mean()
+# ----------------------------- Utilities -----------------------------
 
-def rsi_wilder(close, n=14):
+def _normalize_tickers(raw) -> List[str]:
+    """Accepts a comma string or list and returns a de-duped, uppercased list."""
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    ticks = [str(t).strip().upper() for t in (raw or []) if str(t).strip()]
+    seen, out = set(), []
+    for t in ticks:
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
+
+
+def _get_query_params():
+    return st.query_params if hasattr(st, "query_params") else st.experimental_get_query_params()
+
+
+def _set_query_params(**kwargs):
+    if hasattr(st, "query_params"):
+        for k, v in kwargs.items():
+            st.query_params[k] = v
+    else:
+        st.experimental_set_query_params(**kwargs)
+
+
+# ----------------------------- Indicator functions -----------------------------
+
+def sma(s: pd.Series, n: int) -> pd.Series:
+    return s.rolling(n, min_periods=n).mean()
+
+
+def ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def rsi_wilder(close: pd.Series, n: int = 14) -> pd.Series:
     d = close.diff()
-    gain = (d.where(d > 0, 0.0)).ewm(alpha=1/n, min_periods=n, adjust=False).mean()
-    loss = (-d.where(d < 0, 0.0)).ewm(alpha=1/n, min_periods=n, adjust=False).mean()
+    gain = (d.where(d > 0, 0.0)).ewm(alpha=1 / n, min_periods=n, adjust=False).mean()
+    loss = (-d.where(d < 0, 0.0)).ewm(alpha=1 / n, min_periods=n, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
-    return (100 - 100/(1+rs)).fillna(50)
+    out = 100 - (100 / (1 + rs))
+    return out
 
-def atr_wilder(h, l, c, n=14):
-    pc = c.shift(1)
-    tr = pd.concat([(h-l), (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/n, min_periods=n, adjust=False).mean()
 
-def rule_engine(row):
-    trend = "Up" if row["SMA20"] > row["SMA50"] else "Down"
-    note, action = "", ""
-    if trend == "Up":
-        near = abs(row["Close"] - row["SMA20"]) <= row["ATR14"]
-        neutral = 35 <= row["RSI14"] <= 55
-        if (row["Close"] - row["SMA20"]) > 2 * row["ATR14"]:
-            action, note = "Trim/Take Partial", "Extended > 2×ATR above 20SMA"
-        elif near and neutral:
-            action, note = "Look to Buy", "Near 20SMA + neutral RSI"
-        else:
-            action = "Hold"
-    else:
-        action = "Avoid/Wait"
-        if row["Close"] > row["SMA50"]:
-            note = "Counter-trend"
-    return pd.Series([trend, note, action], index=["Trend","SetupNote","SuggestedAction"])
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    fast_ema = ema(close, fast)
+    slow_ema = ema(close, slow)
+    macd_line = fast_ema - slow_ema
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
 
-# ---------- Position sizing ----------
-def position_size(account_size, risk_pct, entry, stop, allow_fractional=False):
-    if all(x is not None for x in [account_size, risk_pct, entry, stop]) and entry > stop:
-        rps = entry - stop
-        dollars = account_size * (risk_pct/100.0)
-        if rps <= 0:
-            return (0 if not allow_fractional else 0.0), 0.0, 0.0
-        if allow_fractional:
-            shares = dollars / rps
-        else:
-            shares = int(np.floor(dollars / rps))
-        return shares, rps, shares * entry
-    return (0 if not allow_fractional else 0.0), 0.0, 0.0
 
-# ---------- Email ----------
-def send_email_smtp(recipient, subject, body, smtp=None):
-    """Uses Streamlit secrets if present. Provide smtp dict override to use custom creds."""
-    if smtplib is None:
-        return False, "smtplib not available"
-    # Secrets structure in Streamlit Cloud:
-    # [smtp]
-    # host="smtp.gmail.com"
-    # port=587
-    # user="you@example.com"
-    # pass="app_password"
-    conf = smtp or st.secrets.get("smtp", {})
-    host = conf.get("host", "smtp.gmail.com")
-    port = int(conf.get("port", 587))
-    user = conf.get("user", "")
-    pw   = conf.get("pass", "")
-    if not (recipient and user and pw and host and port):
-        return False, "Missing SMTP settings or recipient"
-    msg = f"Subject: {subject}\nFrom: {user}\nTo: {recipient}\n\n{body}"
-    try:
-        context = ssl.create_default_context()
-        with smtplib.SMTP(host, port) as server:
-            server.starttls(context=context)
-            server.login(user, pw)
-            server.sendmail(user, [recipient], msg.encode("utf-8"))
-        return True, "Sent"
-    except Exception as e:
-        return False, str(e)
+def bollinger(close: pd.Series, n: int = 20, num_std: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    ma = sma(close, n)
+    sd = close.rolling(n, min_periods=n).std()
+    upper = ma + num_std * sd
+    lower = ma - num_std * sd
+    return upper, ma, lower
 
-# ---------- UI: Sidebar ----------
-st.set_page_config(page_title="Swing Trading Dashboard", layout="wide")
-st.title("📈 Swing Trading Dashboard — Watchlist • Positions • Trade Log • Alerts")
 
-with st.sidebar:
-    st.header("Settings")
-    account_size = st.number_input("Account Size ($)", min_value=0.0, value=1000.0, step=50.0, format="%.2f")
-    risk_pct     = st.number_input("Risk per Trade (%)", min_value=0.0, value=1.00, step=0.25, format="%.2f")
-    stop_mult    = st.number_input("ATR Multiplier (Initial Stop)", min_value=0.1, value=1.5, step=0.1, format="%.1f")
-    trail_mult   = st.number_input("ATR Multiplier (Trail Stop)", min_value=0.1, value=2.0, step=0.1, format="%.1f")
-    allow_fractional = st.checkbox("Allow fractional shares", value=True)
-    st.caption("Uptrend = SMA20 > SMA50. Buy zone ≈ within 1×ATR of 20SMA with RSI14 between 35–55.")
-
-    st.divider()
-    st.subheader("Data Source")
-    source = st.radio("Choose source", ["Upload CSV", "Yahoo Finance"], index=0)
-    if source == "Yahoo Finance":
-        tickers = st.text_input("Tickers (comma-separated)", value="AAPL, MSFT, NVDA")
-        end   = dt.date.today()
-        start = end - dt.timedelta(days=365)
-        start_date = st.date_input("Start", value=start)
-        end_date   = st.date_input("End",   value=end)
-    else:
-        uploaded = st.file_uploader("Upload OHLCV CSV (Date,Open,High,Low,Close,Volume[,Ticker])", type=["csv"])
-
-# ---------- Load Data ----------
-df = pd.DataFrame()
+# ----------------------------- Data loading -----------------------------
 
 @st.cache_data(show_spinner=False)
-def load_yf(symbols, start_date, end_date):
+def fetch_prices(tickers: Tuple[str, ...], start: Optional[dt.date], end: Optional[dt.date], interval: str) -> pd.DataFrame:
+    """Download prices via yfinance and return a long DataFrame with columns:
+    Date, Ticker, Open, High, Low, Close, Volume
+    """
     if yf is None:
-        return pd.DataFrame(), "yfinance not installed"
-    try:
-        data = yf.download(symbols, start=start_date, end=end_date, auto_adjust=False, threads=True, group_by='ticker')
-        frames = []
-        for sym in symbols:
-            try:
-                d = data[sym].reset_index().rename(columns=str.title)
-                d["Ticker"] = sym
-                frames.append(d[["Date","Open","High","Low","Close","Volume","Ticker"]])
-            except Exception:
-                pass
-        if frames:
-            return pd.concat(frames).dropna().reset_index(drop=True), ""
-        return pd.DataFrame(), "No data"
-    except Exception as e:
-        return pd.DataFrame(), str(e)
+        raise RuntimeError("yfinance not installed. Add 'yfinance' to requirements.txt")
 
-if source == "Yahoo Finance":
-    syms = [s.strip().upper() for s in tickers.split(",") if s.strip()]
-    if syms:
-        df, err = load_yf(syms, start_date, end_date)
-        if err:
-            st.warning(f"Yahoo: {err}")
-else:
-    if uploaded is not None:
-        try:
-            df = pd.read_csv(uploaded)
-            if "Ticker" not in df.columns:
-                df["Ticker"] = "TICK"
-            df["Date"] = pd.to_datetime(df["Date"])
-            df = df.sort_values(["Ticker","Date"]).reset_index(drop=True)
-        except Exception as e:
-            st.error(f"CSV read error: {e}")
+    if not tickers:
+        return pd.DataFrame()
 
-if df.empty:
-    st.info("Load data to begin — use Yahoo Finance or upload your CSV.")
-    st.stop()
+    # yfinance accepts list/space-separated string
+    dl = yf.download(list(tickers), start=start, end=end, interval=interval,
+                     group_by="ticker", auto_adjust=False, threads=False, progress=False)
 
-# ---------- Indicators & Signals ----------
-def compute_indicators(g):
+    if dl is None or getattr(dl, "empty", True):
+        return pd.DataFrame()
+
+    # If MultiIndex columns (multiple tickers), reshape to long
+    if isinstance(dl.columns, pd.MultiIndex):
+        # columns like ('AAPL','Open') ... we want rows per (Date, Ticker)
+        long_df = (
+            dl.stack(level=0)  # ticker level to rows
+              .rename_axis(["Date", "Ticker"])  # index names
+              .reset_index()
+        )
+    else:
+        # Single ticker frame: Date is index, OHLCV are columns
+        long_df = dl.reset_index()
+        # If only one ticker, ensure a Ticker column
+        t0 = tickers[0] if tickers else "TICKER"
+        long_df["Ticker"] = t0
+
+    # Standardize column names
+    long_df = long_df.rename(columns={"Adj Close": "Close", "Date": "Date"})
+
+    # Defensive: ensure required columns exist
+    required = {"Date", "Open", "High", "Low", "Close", "Volume", "Ticker"}
+    missing = required.difference(long_df.columns)
+    if missing:
+        raise KeyError(f"Missing columns after download/reshape: {sorted(missing)}")
+
+    long_df["Date"] = pd.to_datetime(long_df["Date"], errors="coerce")
+    long_df = long_df.dropna(subset=["Date"]).copy()
+    return long_df
+
+
+def compute_indicators(g: pd.DataFrame) -> pd.DataFrame:
+    # Ensure Date column exists (in case of grouping shenanigans)
+    if "Date" not in g.columns:
+        g = g.reset_index()
     g = g.sort_values("Date").copy()
+
+    # Indicators
     g["SMA20"] = sma(g["Close"], 20)
     g["SMA50"] = sma(g["Close"], 50)
+    g["EMA12"] = ema(g["Close"], 12)
+    g["EMA26"] = ema(g["Close"], 26)
     g["RSI14"] = rsi_wilder(g["Close"], 14)
-    g["ATR14"] = atr_wilder(g["High"], g["Low"], g["Close"], 14)
-    g[["Trend","SetupNote","SuggestedAction"]] = g.apply(rule_engine, axis=1)
+    m, s, h = macd(g["Close"])  # MACD
+    g["MACD"], g["MACDsig"], g["MACDhist"] = m, s, h
+    bb_u, bb_m, bb_l = bollinger(g["Close"])  # Bollinger
+    g["BBU"], g["BBM"], g["BBL"] = bb_u, bb_m, bb_l
+
+    # Daily returns
+    g["Ret"] = g["Close"].pct_change()
     return g
 
-df = df.groupby("Ticker", group_keys=False).apply(compute_indicators)
-latest = df.sort_values("Date").groupby("Ticker").tail(1).copy()
 
-# ---------- Tabs ----------
-tab1, tab2, tab3, tab4 = st.tabs(["🔎 Watchlist", "📦 Positions", "📘 Trade Log", "⚙️ Alerts & Broker"])
+def bull_flag_score(df: pd.DataFrame, lookback: int = 25) -> float:
+    """Very simple bull-flag heuristic: strong run-up then a tight, downward-sloping consolidation.
+    Returns a score 0..1; higher ~ more flag-like. Not financial advice.
+    """
+    if len(df) < lookback + 5:
+        return 0.0
+    sub = df.tail(lookback).copy()
+    # 1) prior momentum: price above SMA20 and SMA20 above SMA50
+    mom = float((sub["Close"].iloc[-1] > sub["SMA20"].iloc[-1] > sub["SMA50"].iloc[-1]))
+    # 2) consolidation: last 5 bars ATR-like width vs prior move
+    rng = (sub["High"].max() - sub["Low"].min())
+    recent = sub.tail(5)
+    cons_width = (recent["High"] - recent["Low"]).mean()
+    tight = 1.0 - float(cons_width / rng) if rng > 0 else 0.0
+    tight = max(0.0, min(1.0, tight))
+    # 3) mild downward slope in last 5 closes
+    slope = np.polyfit(range(5), recent["Close"].to_numpy(), 1)[0]
+    down = 1.0 if slope < 0 else 0.0
+    # weighted combo
+    score = 0.45 * mom + 0.35 * tight + 0.20 * down
+    return round(float(max(0.0, min(1.0, score))), 3)
 
-# --- Watchlist ---
-with tab1:
-    st.subheader("Signals (latest close)")
-    cols = ["Ticker","Date","Close","SMA20","SMA50","RSI14","ATR14","Trend","SetupNote","SuggestedAction"]
-    st.dataframe(latest[cols].set_index("Ticker"), use_container_width=True)
 
-    st.markdown("**Position Sizing**")
-    c1, c2, c3, c4, c5 = st.columns([1.2,1.2,1.2,1.2,2])
-    with c1:
-        sel = st.selectbox("Select Ticker", options=sorted(latest["Ticker"].unique()))
-    row = latest[latest["Ticker"] == sel].iloc[0]
-    with c2:
-        planned_entry = st.number_input("Planned Entry", value=float(round(row["Close"],2)))
-    with c3:
-        initial_stop = planned_entry - (row["ATR14"] * stop_mult)
-        st.metric("Initial Stop", f"{initial_stop:.2f}")
-    with c4:
-        st.metric("ATR14", f"{row['ATR14']:.2f}")
-        st.metric("20/50 SMA", f"{row['SMA20']:.2f} / {row['SMA50']:.2f}")
-    with c5:
-        shares, rps, alloc = position_size(account_size, risk_pct, planned_entry, initial_stop, allow_fractional)
-        shares_display = f"{shares:.4f}" if allow_fractional else str(int(shares))
-        st.write(f"**Risk/Share:** {rps:.2f}")
-        st.write(f"**Position Size (sh):** {shares_display}")
-        st.write(f"**Alloc ($):** {alloc:,.2f}")
+# ----------------------------- UI: Init State + Sidebar -----------------------------
 
-    if (not allow_fractional) and isinstance(shares, int) and shares == 0:
-        st.caption("Shares = 0 because your per-share risk exceeds your $ risk limit. Try a cheaper ticker, tighter stop, or enable fractional shares.")
+st.set_page_config(page_title="Swing Dashboard", layout="wide")
 
-    st.caption("Sizing = floor((Account × Risk%) / (Entry − Stop)) if fractional OFF; else (Account × Risk%)/(Entry − Stop).")
+# Initialize tickers from URL once per session
+if "tickers" not in st.session_state:
+    qp = _get_query_params()
+    initial = qp.get("tickers", [])
+    if isinstance(initial, list) and len(initial) == 1:
+        initial = initial[0]
+    st.session_state.tickers = _normalize_tickers(initial)
 
-    # ---- Charts (with explicit checks) ----
-    st.subheader("Charts")
+# Date defaults
+if "date_start" not in st.session_state:
+    st.session_state.date_start = dt.date.today() - dt.timedelta(days=365)
+if "date_end" not in st.session_state:
+    st.session_state.date_end = dt.date.today()
 
-    # 1) Verify Plotly import
-    try:
-        import plotly.graph_objects as _go
-        import plotly.express as _px
-    except Exception as e:
-        st.error("Plotly is not installed. Add 'plotly' to requirements.txt and redeploy.")
-        st.caption(f"(Import error: {e})")
-        st.stop()
+# Sidebar controls
+with st.sidebar:
+    st.title("⚡ Swing Dashboard")
+    st.caption("URL & session-persistent watchlist")
 
-    # 2) Get last ~200 bars for the selected ticker
-    view = df[df["Ticker"] == sel].copy().tail(200)
+    st.subheader("Watchlist")
+    # Show current list
+    st.write(", ".join(st.session_state.tickers) or "—")
 
-    # 3) Validate data before plotting
-    needed = ["Date","Open","High","Low","Close","SMA20","SMA50","RSI14"]
-    missing = [c for c in needed if c not in view.columns]
-    if missing:
-        st.error(f"Missing columns for chart: {missing}. Check your CSV column names.")
-        st.stop()
-    if view.empty or view["Close"].isna().all():
-        st.warning("No price data to plot. Try different tickers or a wider date range.")
-        st.stop()
+    # Freeform input (comma-separated)
+    if "tickers_input" not in st.session_state:
+        st.session_state.tickers_input = ",".join(st.session_state.tickers)
 
-    # 4) Price + SMAs
-    candles = _go.Candlestick(
-        x=view["Date"],
-        open=view["Open"], high=view["High"], low=view["Low"], close=view["Close"],
-        name="Price"
-    )
-    sma20_line = _go.Scatter(x=view["Date"], y=view["SMA20"], name="SMA20")
-    sma50_line = _go.Scatter(x=view["Date"], y=view["SMA50"], name="SMA50")
-    fig = _go.Figure(data=[candles, sma20_line, sma50_line])
-    fig.update_layout(height=500, xaxis_rangeslider_visible=False, margin=dict(l=20,r=20,t=30,b=20))
-    st.plotly_chart(fig, use_container_width=True)
+    def _persist_tickers_to_url():
+        csv = ",".join(st.session_state.tickers)
+        _set_query_params(tickers=csv)
 
-    # 5) RSI panel
-    rsi_fig = _px.line(view, x="Date", y="RSI14", title="RSI14")
-    rsi_fig.add_hline(y=30, line_dash="dot")
-    rsi_fig.add_hline(y=70, line_dash="dot")
-    st.plotly_chart(rsi_fig, use_container_width=True)
+    def _on_input_change():
+        new_list = _normalize_tickers(st.session_state.tickers_input)
+        st.session_state.tickers = new_list
+        _persist_tickers_to_url()
 
-# --- Positions ---
-def default_positions_df():
-    cols = [
-        "Ticker","EntryDate","EntryPrice","Shares","InitialStop",
-        "ATR14_Entry","TrailMult","TrailStop","Last","Target1R","Target2R",
-        "UnrealizedPL","PLpct","Rmultiple","Status","Notes"
-    ]
-    return pd.DataFrame(columns=cols)
+    st.text_input("Tickers (comma-separated)", key="tickers_input", placeholder="AAPL, MSFT, NVDA", on_change=_on_input_change)
 
-with tab2:
-    st.subheader("Open Positions")
-    if "positions" not in st.session_state:
-        st.session_state.positions = default_positions_df()
-
-    def recompute_positions(df_pos, market_latest, trail_mult_default):
-        df_pos = df_pos.copy()
-        last_map = market_latest.set_index("Ticker")["Close"].to_dict()
-        atr_map  = market_latest.set_index("Ticker")["ATR14"].to_dict()
-
-        for i, r in df_pos.iterrows():
-            t = r.get("Ticker")
-            if not isinstance(t, str) or t == "":
-                continue
-            last = last_map.get(t)
-            atr  = atr_map.get(t)
-
-            if pd.notna(last):
-                df_pos.at[i, "Last"] = last
-
-            # Targets (1R/2R)
-            if pd.notna(r.get("EntryPrice")) and pd.notna(r.get("InitialStop")):
-                risk = r["EntryPrice"] - r["InitialStop"]
-                df_pos.at[i, "Target1R"] = r["EntryPrice"] + risk
-                df_pos.at[i, "Target2R"] = r["EntryPrice"] + 2*risk
-
-            # Trail stop
-            use_mult = r.get("TrailMult", trail_mult_default)
-            if pd.notna(last) and pd.notna(atr) and pd.notna(use_mult) and pd.notna(r.get("InitialStop")):
-                trail_stop = max(r["InitialStop"], last - atr * float(use_mult))
-                df_pos.at[i, "TrailStop"] = trail_stop
-
-            # P/L and R
-            if pd.notna(last) and pd.notna(r.get("EntryPrice")) and pd.notna(r.get("Shares")):
-                pl = (last - r["EntryPrice"]) * r["Shares"]
-                df_pos.at[i, "UnrealizedPL"] = pl
-                df_pos.at[i, "PLpct"] = (last / r["EntryPrice"]) - 1
-                if pd.notna(r.get("InitialStop")) and (r["EntryPrice"] - r["InitialStop"]) != 0:
-                    r_mult = (last - r["EntryPrice"]) / (r["EntryPrice"] - r["InitialStop"])
-                    df_pos.at[i, "Rmultiple"] = r_mult
-        return df_pos
-
-    edited = st.data_editor(
-        st.session_state.positions,
-        num_rows="dynamic",
-        column_config={
-            "EntryDate": st.column_config.DateColumn(format="YYYY-MM-DD"),
-            "Status": st.column_config.SelectboxColumn(options=["Open","Reduce","Close Soon","On Watch"]),
-        },
-        use_container_width=True
-    )
-    st.session_state.positions = recompute_positions(edited, latest, trail_mult)
-
-    cpos1, cpos2, cpos3 = st.columns(3)
-    with cpos1:
-        st.download_button(
-            "⬇️ Download Positions CSV",
-            st.session_state.positions.to_csv(index=False).encode(),
-            "positions.csv",
-            "text/csv",
-        )
-    with cpos2:
-        pos_csv = st.file_uploader("Upload Positions CSV", type=["csv"], key="pos_up")
-        if pos_csv is not None:
-            st.session_state.positions = pd.read_csv(pos_csv)
-            st.success("Positions loaded.")
-    with cpos3:
-        if st.button("Recompute Now"):
-            st.session_state.positions = recompute_positions(st.session_state.positions, latest, trail_mult)
-
-# --- Trade Log ---
-def default_log_df():
-    cols = ["Ticker","Setup","EntryDate","ExitDate","EntryPrice","ExitPrice","Shares","GrossPL","R","Notes"]
-    return pd.DataFrame(columns=cols)
-
-with tab3:
-    st.subheader("Closed Trades / Journal")
-    if "tradelog" not in st.session_state:
-        st.session_state.tradelog = default_log_df()
-
-    def recompute_log(df_log, pos_df):
-        df_log = df_log.copy()
-        stop_map = {}
-        if pos_df is not None and not pos_df.empty:
-            stop_map = pos_df.dropna(subset=["Ticker","InitialStop"]).set_index("Ticker")["InitialStop"].to_dict()
-        for i, r in df_log.iterrows():
-            if pd.notna(r.get("ExitPrice")) and pd.notna(r.get("EntryPrice")) and pd.notna(r.get("Shares")):
-                df_log.at[i,"GrossPL"] = (r["ExitPrice"] - r["EntryPrice"]) * r["Shares"]
-                stop = stop_map.get(r.get("Ticker"))
-                if stop is not None and pd.notna(stop) and r["EntryPrice"] != stop:
-                    df_log.at[i,"R"] = (r["ExitPrice"] - r["EntryPrice"]) / (r["EntryPrice"] - stop)
-        return df_log
-
-    edited_log = st.data_editor(
-        st.session_state.tradelog,
-        num_rows="dynamic",
-        column_config={
-            "EntryDate": st.column_config.DateColumn(format="YYYY-MM-DD"),
-            "ExitDate": st.column_config.DateColumn(format="YYYY-MM-DD"),
-            "Setup": st.column_config.SelectboxColumn(options=["Pullback20","Breakout","Reversal","Other"]),
-        },
-        use_container_width=True
-    )
-    st.session_state.tradelog = recompute_log(edited_log, st.session_state.get("positions"))
-
-    if not st.session_state.tradelog.empty:
-        realized = st.session_state.tradelog["GrossPL"].fillna(0).sum()
-        avg_r = st.session_state.tradelog["R"].replace([np.inf,-np.inf], np.nan).dropna().mean()
+    with st.form("ticker_add_remove", clear_on_submit=True):
+        new_tick = st.text_input("Add one ticker", key="new_tick")
+        to_remove = st.multiselect("Remove selected", st.session_state.tickers, key="to_remove")
         c1, c2 = st.columns(2)
-        c1.metric("Realized P/L", f"${realized:,.2f}")
-        c2.metric("Avg R", f"{avg_r:.2f}" if pd.notna(avg_r) else "-")
+        do_add = c1.form_submit_button("Add")
+        do_remove = c2.form_submit_button("Remove")
 
-    clog1, clog2 = st.columns(2)
-    with clog1:
-        st.download_button(
-            "⬇️ Download Trade Log CSV",
-            st.session_state.tradelog.to_csv(index=False).encode(),
-            "trade_log.csv",
-            "text/csv",
-        )
-    with clog2:
-        log_csv = st.file_uploader("Upload Trade Log CSV", type=["csv"], key="log_up")
-        if log_csv is not None:
-            st.session_state.tradelog = pd.read_csv(log_csv)
-            st.success("Trade log loaded.")
+    if do_add and new_tick:
+        t = new_tick.strip().upper()
+        if t and t not in st.session_state.tickers:
+            st.session_state.tickers.append(t)
+            st.session_state.tickers_input = ",".join(st.session_state.tickers)
+            _persist_tickers_to_url()
+        elif t:
+            st.info(f"{t} is already on the list.")
 
-# --- Alerts & Broker ---
-with tab4:
-    st.subheader("Signal Alerts")
-    st.caption("Sends an email when any ticker is in the “Look to Buy” state (based on latest close).")
-    default_to = st.secrets.get("alert_to", "")
-    recipient = st.text_input("Recipient email", value=default_to)
-    if st.button("Scan & Send Alerts"):
-        alerts = latest[latest["SuggestedAction"] == "Look to Buy"].copy()
-        if alerts.empty:
-            st.info("No 'Look to Buy' signals right now.")
-        else:
-            lines = ["Swing Signal Alerts:\n"]
-            for _, r in alerts.iterrows():
-                lines.append(f"- {r['Ticker']}: Close={r['Close']:.2f} | SMA20={r['SMA20']:.2f} | ATR={r['ATR14']:.2f} | RSI={r['RSI14']:.1f}")
-            ok, msg = send_email_smtp(recipient, "Swing Alerts", "\n".join(lines))
-            if ok:
-                st.success(f"Email sent to {recipient}")
-            else:
-                st.error(f"Email failed: {msg}")
+    if do_remove and st.session_state.to_remove:
+        st.session_state.tickers = [t for t in st.session_state.tickers if t not in st.session_state.to_remove]
+        st.session_state.tickers_input = ",".join(st.session_state.tickers)
+        _persist_tickers_to_url()
 
     st.divider()
-    st.subheader("Alpaca (demo)")
-    st.caption("Shows how to wire a broker. Requires keys and may need paid data.")
-    alp = st.secrets.get("alpaca", {})
-    ak = st.text_input("ALPACA_API_KEY", value=alp.get("key", ""))
-    sk = st.text_input("ALPACA_API_SECRET", value=alp.get("secret", ""), type="password")
-    base = st.text_input("Base URL", value=alp.get("base", "https://paper-api.alpaca.markets"))
-    if requests is None:
-        st.info("Install requests to use this demo (add 'requests' to requirements.txt).")
-    elif st.button("Check Alpaca Account"):
-        try:
-            hdrs = {"APCA-API-KEY-ID": ak, "APCA-API-SECRET-KEY": sk}
-            r = requests.get(base.rstrip("/") + "/v2/account", headers=hdrs, timeout=10)
-            if r.status_code == 200:
-                acct = r.json()
-                st.write({k: acct.get(k) for k in ["id","currency","cash","portfolio_value","status"]})
-            else:
-                st.warning(f"Status {r.status_code}: {r.text[:200]}")
-        except Exception as e:
-            st.error(f"Alpaca call failed: {e}")
+    st.subheader("Data Settings")
+    st.session_state.date_start = st.date_input("Start", value=st.session_state.date_start)
+    st.session_state.date_end = st.date_input("End", value=st.session_state.date_end)
+    interval = st.selectbox("Interval", ["1d", "1h", "30m", "15m", "5m"], index=0)
+
+    st.divider()
+    st.subheader("Indicators")
+    show_ma = st.checkbox("SMA20 / SMA50", value=True)
+    show_bb = st.checkbox("Bollinger Bands", value=False)
+    show_macd = st.checkbox("MACD (below)", value=True)
+    show_rsi = st.checkbox("RSI (below)", value=True)
+
+
+# ----------------------------- Main: Data + Views -----------------------------
+
+st.title("📈 Swing Trading Dashboard — Resilient")
+
+# Fetch data
+with st.status("Downloading & computing…", expanded=False) as status:
+    tickers = st.session_state.tickers
+    if not tickers:
+        st.info("Add tickers in the sidebar to begin.")
+        st.stop()
+
+    try:
+        df = fetch_prices(tuple(tickers), st.session_state.date_start, st.session_state.date_end, interval)
+    except Exception as e:
+        st.error(f"Data download failed: {e}")
+        st.stop()
+
+    if df.empty:
+        st.warning("No data returned. Check tickers/date range/interval.")
+        st.stop()
+
+    try:
+        df = df.groupby("Ticker", group_keys=False, sort=False).apply(compute_indicators)
+    except KeyError as ke:
+        st.error(f"Indicator computation failed: {ke}")
+        st.write("Columns present:", list(df.columns))
+        st.stop()
+
+    status.update(label="Ready", state="complete")
+
+# ----------------------------- Screener: Bull-flag heuristic -----------------------------
+
+st.subheader("📌 Quick Screener — Bull Flag Heuristic (0..1)")
+
+scores = (
+    df.groupby("Ticker", group_keys=False)
+      .apply(lambda g: bull_flag_score(g))
+      .reset_index(name="FlagScore")
+      .sort_values("FlagScore", ascending=False)
+)
+
+st.dataframe(scores, use_container_width=True)
+
+# ----------------------------- Charts -----------------------------
+
+selected = st.multiselect("Choose tickers to chart", tickers, default=tickers[:1])
+
+for t in selected:
+    g = df[df["Ticker"] == t].copy()
+    st.markdown(f"### {t}")
+
+    # Price chart (Plotly if available)
+    if go is not None:
+        fig = go.Figure()
+        fig.add_candlestick(x=g["Date"], open=g["Open"], high=g["High"], low=g["Low"], close=g["Close"], name="OHLC")
+        if show_ma:
+            fig.add_trace(go.Scatter(x=g["Date"], y=g["SMA20"], mode="lines", name="SMA20"))
+            fig.add_trace(go.Scatter(x=g["Date"], y=g["SMA50"], mode="lines", name="SMA50"))
+        if show_bb:
+            fig.add_trace(go.Scatter(x=g["Date"], y=g["BBU"], mode="lines", name="BB Upper"))
+            fig.add_trace(go.Scatter(x=g["Date"], y=g["BBM"], mode="lines", name="BB Mid"))
+            fig.add_trace(go.Scatter(x=g["Date"], y=g["BBL"], mode="lines", name="BB Lower"))
+        fig.update_layout(height=500, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.line_chart(g.set_index("Date")["Close"], height=300)
+        if show_ma:
+            st.line_chart(g.set_index("Date")["SMA20"].dropna(), height=150)
+            st.line_chart(g.set_index("Date")["SMA50"].dropna(), height=150)
+        if show_bb:
+            st.line_chart(g.set_index("Date")[["BBU", "BBM", "BBL"]].dropna(), height=200)
+
+    # MACD / RSI panels
+    if show_macd:
+        if go is not None:
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(x=g["Date"], y=g["MACD"], name="MACD"))
+            fig2.add_trace(go.Scatter(x=g["Date"], y=g["MACDsig"], name="Signal"))
+            fig2.add_trace(go.Bar(x=g["Date"], y=g["MACDhist"], name="Hist"))
+            fig2.update_layout(height=220, margin=dict(l=10, r=10, t=30, b=10))
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.line_chart(g.set_index("Date")["MACD"].dropna(), height=150)
+
+    if show_rsi:
+        if go is not None:
+            fig3 = go.Figure()
+            fig3.add_trace(go.Scatter(x=g["Date"], y=g["RSI14"], name="RSI14"))
+            fig3.update_layout(height=180, margin=dict(l=10, r=10, t=30, b=10), yaxis=dict(range=[0, 100]))
+            st.plotly_chart(fig3, use_container_width=True)
+        else:
+            st.line_chart(g.set_index("Date")["RSI14"].dropna(), height=150)
+
+st.caption("Not financial advice. Educational purposes only.")
