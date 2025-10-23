@@ -1,6 +1,6 @@
 # swing_dashboard_pro_resilient.py
-# Streamlit Swing Dashboard — resilient and deploy-ready
-# Includes: signals, alerts, position log, risk sizing, charting, simple backtest
+# Streamlit Swing Dashboard — resilient and deploy-ready (no email code)
+# Includes: signals, risk sizing, position log (optional), charting, simple backtest
 
 import math
 import datetime as dt
@@ -19,13 +19,6 @@ try:
     import plotly.graph_objects as go
 except Exception:
     go = None
-
-try:
-    import smtplib, ssl
-except Exception:
-    smtplib = None
-    ssl = None
-
 
 # ----------------------------- Utility Functions -----------------------------
 
@@ -132,7 +125,7 @@ def fetch_prices(tickers: Tuple[str, ...], start: dt.date, end: dt.date, interva
     return long_df.dropna(subset=["Date"])
 
 
-# ----------------------------- Indicators -----------------------------
+# ----------------------------- Indicators + Signals -----------------------------
 
 def compute_indicators(g: pd.DataFrame) -> pd.DataFrame:
     g = g.sort_values("Date").copy()
@@ -149,44 +142,6 @@ def compute_indicators(g: pd.DataFrame) -> pd.DataFrame:
     g["macd_down"] = (g["MACD"].shift(1) >= g["MACDsig"].shift(1)) & (g["MACD"] < g["MACDsig"])
     g["exit_sig"] = (g["Close"] < g["SMA20"]) | (g["RSI14"] < 45) | g["macd_down"]
     return g
-
-
-# ----------------------------- Email Alerts -----------------------------
-
-def send_email_alert(subject: str, body: str, to_email: str) -> str:
-    """Send email using credentials in st.secrets"""
-    if smtplib is None or ssl is None:
-        return "Email libs missing."
-    secrets = st.secrets if hasattr(st, "secrets") else {}
-    required = ["EMAIL_HOST", "EMAIL_PORT", "EMAIL_USER", "EMAIL_PASSWORD", "EMAIL_FROM"]
-    if not all(k in secrets for k in required):
-        return "Email secrets missing in st.secrets."
-
-    host = secrets["EMAIL_HOST"]
-    port = int(secrets["EMAIL_PORT"])
-    user = secrets["EMAIL_USER"]
-    pwd = secrets["EMAIL_PASSWORD"]
-    from_addr = secrets["EMAIL_FROM"]
-
-    msg = (
-        f"From: {from_addr}
-"
-        f"To: {to_email}
-"
-        f"Subject: {subject}
-
-"
-        f"{body}"
-    )
-
-    try:
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(host, port, context=context, timeout=20) as server:
-            server.login(user, pwd)
-            server.sendmail(from_addr, [to_email], msg.encode("utf-8"))
-        return "Email sent successfully"
-    except Exception as e:
-        return f"Email failed: {e}"
 
 
 # ----------------------------- Backtest -----------------------------
@@ -252,7 +207,7 @@ def backtest_signals(g: pd.DataFrame, cash0: float = 10000.0, slippage_bps: floa
 # ----------------------------- Streamlit UI -----------------------------
 
 st.set_page_config(page_title="Swing Dashboard", layout="wide")
-st.title("📈 Swing Trading Dashboard — Signals, Risk, Log, Backtest")
+st.title("📈 Swing Trading Dashboard — Signals, Risk, Backtest")
 
 # Sidebar
 with st.sidebar:
@@ -262,11 +217,6 @@ with st.sidebar:
     start = st.date_input("Start", dt.date.today() - dt.timedelta(days=365))
     end = st.date_input("End", dt.date.today())
     interval = st.selectbox("Interval", ["1d", "1h", "15m"], index=0)
-
-    st.subheader("Email Alerts")
-    email = st.text_input("Alert email")
-    enable_entry = st.checkbox("Send ENTRY emails")
-    enable_exit = st.checkbox("Send EXIT emails")
 
     st.subheader("Risk Sizing")
     acct_size = st.number_input("Account size ($)", 1000.0)
