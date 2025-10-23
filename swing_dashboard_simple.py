@@ -1,11 +1,10 @@
 # swing_dashboard_simple.py
-# A super simple Streamlit swing dashboard with clear BUY / HOLD / SELL alerts
-# - Minimal inputs
-# - yfinance daily download
-# - Indicators: SMA20/50, RSI14, MACD, Bollinger (width)
-# - Compact snapshot table with color-coded alerts and flags (Breakout / Squeeze / GoldenCross)
-# - One chart (first ticker) with SMA overlays
-# No URL syncing, no email, no backtest, no risk panel — just signals.
+# Simple Streamlit swing dashboard with resilient data fetch & clear BUY/HOLD/SELL alerts
+# - Daily data via yfinance (robust: period fallback, per‑ticker retry, repair)
+# - Indicators: SMA20/50, RSI14, MACD, Bollinger width
+# - Flags: Breakout (HH20 + volume), Squeeze (narrow bands), GoldenCross
+# - Snapshot table + one candlestick chart (first ticker)
+# No URL syncing, no email, no backtest — focused and sturdy.
 
 import datetime as dt
 from typing import List, Tuple
@@ -42,16 +41,16 @@ def sma(s: pd.Series, n: int) -> pd.Series:
     return s.rolling(n, min_periods=n).mean()
 
 
+def ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
+
+
 def rsi_wilder(close: pd.Series, n: int = 14) -> pd.Series:
     d = close.diff()
     gain = (d.where(d > 0, 0.0)).ewm(alpha=1 / n, min_periods=n, adjust=False).mean()
     loss = (-d.where(d < 0, 0.0)).ewm(alpha=1 / n, min_periods=n, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
-
-
-def ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=n, adjust=False).mean()
 
 
 def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
@@ -71,38 +70,95 @@ def bollinger(close: pd.Series, n: int = 20, k: float = 2.0):
     width = (upper - lower) / mid.replace(0, np.nan)
     return upper, mid, lower, width
 
-# ---------------- Data ----------------
+# ---------------- Resilient Data Fetch ----------------
 
 @st.cache_data(show_spinner=False)
 def fetch_prices(tickers: Tuple[str, ...], start: dt.date, end: dt.date) -> pd.DataFrame:
+    """Robust daily OHLCV fetch.
+    Strategy:
+    - Use yf.download for all tickers with repair & no-raise
+    - Prefer `period=1y` when the range is ~1y (sidestep tz lookup issues)
+    - If bulk fetch empty: fallback to per‑ticker Ticker().history() with retry
+    Returns a long DF: Date, Open, High, Low, Close, Volume, Ticker
+    """
     if yf is None:
         raise RuntimeError("yfinance not installed. Add yfinance to requirements.txt")
     if not tickers:
         return pd.DataFrame()
 
-    dl = yf.download(list(tickers), start=start, end=end, interval="1d", group_by="ticker",
-                     auto_adjust=False, threads=False, progress=False)
+    days = (end - start).days
+    use_period = days in (364, 365, 366)
+    period = "1y"
+
+    def _bulk_download():
+        if use_period:
+            return yf.download(
+                list(tickers),
+                period=period,
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=False,
+                threads=False,
+                progress=False,
+                raise_errors=False,
+                repair=True,
+            )
+        else:
+            return yf.download(
+                list(tickers),
+                start=start,
+                end=end,
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=False,
+                threads=False,
+                progress=False,
+                raise_errors=False,
+                repair=True,
+            )
+
+    dl = _bulk_download()
+
+    def _to_long(df: pd.DataFrame) -> pd.DataFrame:
+        if isinstance(df.columns, pd.MultiIndex):
+            out = df.stack(level=0).rename_axis(["Date", "Ticker"]).reset_index()
+        else:
+            out = df.reset_index()
+            out["Ticker"] = tickers[0]
+        return out
 
     if dl is None or getattr(dl, "empty", True):
-        return pd.DataFrame()
-
-    # Normalize to long format
-    if isinstance(dl.columns, pd.MultiIndex):
-        long_df = dl.stack(level=0).rename_axis(["Date", "Ticker"]).reset_index()
+        # Per‑ticker fallback with tiny retry
+        frames = []
+        for t in tickers:
+            for _ in range(2):
+                try:
+                    if use_period:
+                        hist = yf.Ticker(t).history(period=period, interval="1d", auto_adjust=False, repair=True)
+                    else:
+                        hist = yf.Ticker(t).history(start=start, end=end, interval="1d", auto_adjust=False, repair=True)
+                    if hist is not None and not hist.empty:
+                        hist = hist.reset_index().rename(columns={"Date": "Date"})
+                        hist["Ticker"] = t
+                        frames.append(hist[["Date","Open","High","Low","Close","Volume","Ticker"]])
+                        break
+                except Exception:
+                    pass
+        if not frames:
+            return pd.DataFrame()
+        long_df = pd.concat(frames, ignore_index=True)
     else:
-        long_df = dl.reset_index()
-        long_df["Ticker"] = tickers[0]
+        long_df = _to_long(dl)
 
     long_df = long_df.rename(columns={"Adj Close": "Close"})
     long_df["Date"] = pd.to_datetime(long_df["Date"], errors="coerce")
-
-    required = {"Date", "Open", "High", "Low", "Close", "Volume", "Ticker"}
-    missing = required.difference(long_df.columns)
-    if missing:
-        raise KeyError(f"Missing columns after download: {sorted(missing)}")
-
+    required = {"Date","Open","High","Low","Close","Volume","Ticker"}
+    miss = required.difference(long_df.columns)
+    if miss:
+        raise KeyError(f"Missing columns after download: {sorted(miss)}")
     return long_df.dropna(subset=["Date"]).copy()
 
+# ---------------- Indicators + Signals ----------------
 
 def add_indicators_and_signals(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["Ticker", "Date"]).copy()
@@ -129,18 +185,13 @@ def add_indicators_and_signals(df: pd.DataFrame) -> pd.DataFrame:
     df["BBwMA20"] = df.groupby("Ticker", group_keys=False)["BBw"].apply(lambda s: sma(s, 20))
 
     # Flags per ticker
-    # Breakout: Close > 20-day highest high AND Volume > its 20-day SMA
     df["VolSMA20"] = df.groupby("Ticker", group_keys=False)["Volume"].apply(lambda s: sma(s, 20))
     df["HH20"] = df.groupby("Ticker", group_keys=False)["High"].apply(lambda s: s.rolling(20, min_periods=20).max())
     df["breakout"] = (df["Close"] > df["HH20"]) & (df["Volume"] > df["VolSMA20"]) & df["HH20"].notna()
-
-    # Squeeze: current width much lower than its recent average
     df["squeeze"] = (df["BBw"] < (df["BBwMA20"] * 0.66)) & df["BBwMA20"].notna()
-
-    # Golden cross flag (SMA20 crossing above SMA50 today)
     df["golden_cross"] = (df["SMA20"].shift(1) <= df["SMA50"].shift(1)) & (df["SMA20"] > df["SMA50"]) 
 
-    # --- Simple, common-sense signal rules (NOT financial advice) ---
+    # Simple signal rules
     trend_up = df["SMA20"] > df["SMA50"]
     momentum_up = df["MACD"] > df["MACDsig"]
 
@@ -172,7 +223,7 @@ def add_indicators_and_signals(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------- UI ----------------
 
 st.set_page_config(page_title="Simple Swing Dashboard", layout="wide")
-st.title("🪄 Simple Swing Dashboard — Alerts")
+st.title("🪄 Simple Swing Dashboard — Alerts (Resilient)")
 
 with st.sidebar:
     st.subheader("Watchlist")
@@ -208,7 +259,6 @@ except Exception as e:
 latest_date = df["Date"].max()
 latest = df[df["Date"] == latest_date]
 
-# Map signals to emojis for quick scanning
 sig_icon = {
     "BUY": "🟢 BUY",
     "HOLD": "🟡 HOLD",
